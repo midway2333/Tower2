@@ -22,7 +22,7 @@
 | 特性 |Tower GPT| Tower 2 | LLaMA 3 | Qwen 2.5 | DeepSeek V3 / R1 |
 | :----: | :----: | :----: | :----: | :----: | :----: |
 | 注意力 | MHA | **MLA** | GQA | GQA | MLA |
-|前馈网络| FFN | **MoE/FFN** | FFN | MoE/FFN | MoE |
+|前馈网络| FFN | **MoE / FFN** | FFN | MoE / FFN | MoE |
 |多模态| 否 | **是** | 是 | 是 | 否 |
 |KV Cache| 否 |**施工中**| 是 | 是 | 是 |
 |激活函数|GELU|**SwiGLU / GELU**|SwiGLU|SwiGLU|SwiGLU|
