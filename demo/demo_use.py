@@ -19,18 +19,16 @@ class MultimodalInferencer:
         # 初始化模型
         self.model = self._init_model(config['model_config'])
         self.model.load_state_dict(torch.load(config['model_path'], map_location=self.device, weights_only=True))
-        self.model.train()
+        self.model.eval()
         
         # 图像预处理
         self.img_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                 std=[0.229, 0.224, 0.225])
         ])
     
     def _init_model(self, model_config):
         # 模型结构与训练代码保持一致
-        return Tower2_Model(
+        return Tower2_Model(   # type: ignore
             vocab_size=model_config['vocab_size'],
             dk=model_config['dk'],
             head_num=model_config['head_num'],
@@ -43,6 +41,8 @@ class MultimodalInferencer:
             patch_size=model_config['patch_size'],
             in_chans=model_config['in_chans'],
             device=self.device.type,
+            max_len=20000,
+            max_cache=5,
             use_dropout=False,
             init_weights=False,
             ffn_type=model_config['ffn_type']
@@ -110,7 +110,7 @@ if __name__ == "__main__":
             "head_num": 6,
             "share_num": 4,
             "exp_num": 8,
-            "top_k": 2,
+            "top_k": 4,
             "coder_num": 6,
             "img_size": 512,
             "patch_size": 28,

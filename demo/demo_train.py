@@ -1,6 +1,4 @@
-from sympy import N
 import torch
-import torch.nn as nn
 from tower2 import *
 import os
 import json
@@ -109,18 +107,20 @@ def DemoTrain():
     )
 
     # 初始化模型
-    model = Tower2_Model(
+    model = Tower2_Model(   # type: ignore
         vocab_size=dataset.sp.vocab_size(),  # 使用SentencePiece的词汇表大小
         dk=64,
         head_num=6,
         share_num=4,
         exp_num=8,
-        top_k=2,
+        top_k=4,
         coder_num=6,
         pad_idx=dataset.pad_id,  # 使用SentencePiece的pad_id
         img_size=512,
         patch_size=28,
         in_chans=3,
+        max_len=1024,
+        max_cache=0,
         device="cuda",
         use_dropout=True,
         init_weights=False,
@@ -130,7 +130,7 @@ def DemoTrain():
     # 训练配置
     optimizer = AdamW8bit(model.parameters(), lr=1e-4)
     
-    for epoch in range(100):
+    for epoch in range(150):
         model.train()
         total_loss = 0
         
@@ -163,6 +163,7 @@ def DemoTrain():
             optimizer.step()
             
             total_loss += loss.item()
+
         
         print(f"Epoch {epoch+1} | Avg Loss: {total_loss/len(dataloader):.4f}")
 
