@@ -24,7 +24,7 @@
 | 注意力 | MHA | **MLA** | GQA | GQA | MLA |
 |前馈网络| FFN | **MoE / FFN** | FFN | MoE / FFN | MoE |
 |多模态| 否 | **是** | 是 | 是 | 否 |
-|KV Cache| 否 |**施工中**| 是 | 是 | 是 |
+|KV Cache| 否 |**是**| 是 | 是 | 是 |
 |激活函数|GELU|**SwiGLU / GELU**|SwiGLU|SwiGLU|SwiGLU|
 |开源协议|MIT|**CC-0**|LLaMA3 License|Apache 2.0| MIT |
 
@@ -49,7 +49,7 @@
 
 #### 🟢 近期计划
 
-- KV Cache
+- KV Cache (已完成)
 - 音频多模态
 
 #### 🔵 长期规划
@@ -67,3 +67,11 @@
 ### 问题与贡献 🤔
 
 - **问题反馈与建议提供**: [提交Issue](https://github.com/midway2333/tower2/issues)
+
+### 更新日志 📝
+
+<details open> 
+<summary>  <b>25.4.13更新</b> </summary>
+- KV Cache 支持 <br>
+- 残差连接修正 <br>
+</details>
