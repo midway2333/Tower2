@@ -70,8 +70,14 @@
 
 ### 更新日志 📝
 
-<details open> 
+<details close> 
 <summary>  <b>25.4.13更新</b> </summary>
 - KV Cache 支持 <br>
 - 残差连接修正 <br>
+</details>
+
+<details open> 
+<summary>  <b>25.4.19更新</b> </summary>
+- 分离encoder和decoder层数参数 <br>
+- kv cache 下的 mask 修正 <br>
 </details>
