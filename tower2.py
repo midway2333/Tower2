@@ -326,7 +326,7 @@ class MLA(MLAframe):
 
         c_kv = self.kv_down_norm(c_kv)
 
-        if not Tower2_Model.train:
+        if not Tower2_Model.train and self.max_cache > 0:
             # ======== 历史缓存处理 ========
             past_c_kv, past_k_rope = torch.split(
                 self.kv_cache[:, :kv_cache_len, :], [self.dc_kv, self.d_rope], dim=-1
@@ -348,6 +348,9 @@ class MLA(MLAframe):
                     k_rope[:, :self.cache_pos.size(0), :],
                 ], dim=-1
             )   # 更新缓存
+
+            mask = None if mask is None else mask[-new_token:, :]
+            # 调整掩码形状
 
         # ======== KV 合并处理 ========
         kv: Tensor = self.kv_up(c_kv)
@@ -373,9 +376,6 @@ class MLA(MLAframe):
         key = torch.concat(
             [k_nope, k_rope.expand(-1, self.head_num, -1, -1)], dim=-1
         )   # 拼接 Key
-
-        mask = None if mask is None else mask[-new_token:, :]
-        # 调整掩码形状
 
         attn_output = fc.scaled_dot_product_attention(
             query, key, value, attn_mask=mask,
@@ -526,7 +526,7 @@ class CrossMLA(MLA):
 
         c_kv = self.kv_down_norm(c_kv)
 
-        if not Tower2_Model.train:
+        if not Tower2_Model.train and self.max_cache > 0:
             # ======== 历史缓存处理 ========
             past_c_kv, past_k_rope = torch.split(
                 self.kv_cache[:, :kv_cache_len, :], [self.dc_kv, self.d_rope], dim=-1
@@ -580,7 +580,6 @@ class CrossMLA(MLA):
         # 变换形状, 输出投影
 
         return output
-
 
 
 class Expert(nn.Module):
@@ -1089,7 +1088,8 @@ class Tower2_Model(nn.Module):
         share_num: int,
         exp_num: int,
         top_k: int,
-        coder_num: int,
+        decoder_num: int,
+        vit_num: int,
         pad_idx: int,
         img_size: int,
         patch_size: int,
@@ -1111,7 +1111,8 @@ class Tower2_Model(nn.Module):
         - share_num: 共享专家数
         - exp_num: 专家数量
         - top_k: 激活专家数
-        - coder_num: 编/解码器数量
+        - decoder_num: 解码器数量
+        - vit_num: vision encoder模型数量
         - pad_idx: 填充索引
         - img_size: 图像大小 (size * size)
         - patch_size: 分割大小 (正方形)
@@ -1146,14 +1147,16 @@ class Tower2_Model(nn.Module):
         ).to(device)
         # 预处理 & 图像分割
 
-        self.visual_encoders = nn.ModuleList([
-            VisionEncoder(
-                head_num=head_num,
-                d=d,
-                dk=dk,
-                use_dropout=use_dropout,
-            ) for _ in range(coder_num)
-        ])   # 视觉编码器
+        self.vit_num = vit_num
+        if vit_num > 0:
+            self.visual_encoders = nn.ModuleList([
+                VisionEncoder(
+                    head_num=head_num,
+                    d=d,
+                    dk=dk,
+                    use_dropout=use_dropout,
+                ) for _ in range(vit_num)
+            ])   # 视觉编码器
 
         self.decoders = nn.ModuleList([
             Decoder(
@@ -1167,7 +1170,7 @@ class Tower2_Model(nn.Module):
                 max_cache=max_cache,
                 use_dropout=use_dropout,
                 ffn_type=ffn_type
-            ) for _ in range(coder_num)
+            ) for _ in range(decoder_num)
         ])   # 解码器
 
         self.final_norm = RMS_norm(d).to(self.device)
@@ -1196,7 +1199,7 @@ class Tower2_Model(nn.Module):
 
         dec_input = embed_output
 
-        if imgs is not None:
+        if imgs is not None and self.vit_num > 0:
             img_emb, patch_mask = self.patch_embed(imgs)
             # 图像嵌入
 
@@ -1251,20 +1254,21 @@ if __name__ == '__main__':
         share_num=4,
         exp_num=8,
         top_k=2,
-        coder_num=6,
+        decoder_num=6,
+        vit_num=6,
         pad_idx=0,
         img_size=1024,
         patch_size=28,
         in_chans=3,
         max_len=256,
-        max_cache=128,
+        max_cache=0,
         device='cuda',
         use_dropout=False,
         init_weights=False,
         ffn_type='moe'
     ).to('cuda')
 
-    # tower = torch.compile(tower)
+    # tower = torch.compile(tower)  # Compile the model for optimization
     output: Tensor = tower(inputs, imgs)
     print(output.shape)
 
