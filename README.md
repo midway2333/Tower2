@@ -76,8 +76,14 @@
 - 残差连接修正 <br>
 </details>
 
-<details open> 
+<details close> 
 <summary>  <b>25.4.19更新</b> </summary>
 - 分离encoder和decoder层数参数 <br>
 - kv cache 下的 mask 修正 <br>
+</details>
+
+<details open> 
+<summary>  <b>25.5.31更新</b> </summary>
+- 添加模型初始化 <br>
+- 重构 kv cache <br>
 </details>
