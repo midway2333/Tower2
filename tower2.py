@@ -1,4 +1,4 @@
-import torch
+import torch, math
 import torch.nn.functional as fc
 from torch import nn, Tensor
 from typing import Optional, Tuple
@@ -266,7 +266,7 @@ class MLAframe(nn.Module):
 
 class MLA(MLAframe):
     """多头潜在注意力, 通过低秩投影 (LoRA) 压缩 Q/K/V 维度"""
-    def __init__(self, d, d_pre_head, head_num, max_len: int, max_cache: int,
+    def __init__(self, d, d_pre_head, head_num, max_len: int, use_cache,
         use_dropout: bool=False, device: Optional[str]=None):
         """
         我的想法是尽量减少亢余参数;  
@@ -277,22 +277,17 @@ class MLA(MLAframe):
         - dk_pre_head: 每个头的隐藏层维度 (非RoPE维度)
         - head_num: 头的数量
         - max_len: 最大序列长度
-        - max_cache: 最大 KV Cache 长度
+        - use_cache: 是否使用 KV 缓存
         - use_dropout: 是否使用dropout
         - device: 计算设备
         """
         super().__init__(d, d_pre_head, head_num, use_dropout, device)
-        assert max_cache <= max_len, "最大序列长度要大于最大缓存长度 | max len must be greater than max cache"
-        # 检查最大长度
-
-        self.max_cache = max_cache
-        # 初始化
 
         # ====== kv cache ======
-        self.register_buffer("kv_cache", torch.zeros(1, max_cache, self.dc_kv + self.d_rope), persistent=False)
-        self.register_buffer("cache_pos", torch.tensor([]), persistent=False)   # 用维度大小记录
-        self.register_buffer("max_len", torch.zeros(max_len), persistent=False)
-        # 初始化缓存
+        self.max_kv_cache = max_len
+        self.use_cache = use_cache
+        self.cache_pos = None   # 缓存位置
+        self.register_buffer("kv_cache", torch.zeros(1, max_len, self.dc_kv + self.d_rope), persistent=False)
 
     def forward(self, inputs: Tensor, pos_ids, mask: Optional[Tensor]=None):   # type: ignore
         """
@@ -301,10 +296,8 @@ class MLA(MLAframe):
         - mask: 掩码
         """
         batch_size, seq_len, _ = inputs.size()
-        self.kv_cache: Tensor = self.kv_cache.expand(batch_size, -1, -1).contiguous()
-        kv_cache_len = self.cache_pos.size(0)   # kv 缓存长度
-        new_token = inputs.size(1) - kv_cache_len
-        self.max_len: Tensor
+        kv_cache_len = self.cache_pos if self.cache_pos is not None else 0   # 已缓存长度
+        new_token = inputs.size(1) - kv_cache_len   # 未缓存的长度
 
         # ===== quary 计算 =====
         q = self.q_down(inputs)
@@ -326,7 +319,10 @@ class MLA(MLAframe):
 
         c_kv = self.kv_down_norm(c_kv)
 
-        if not Tower2_Model.train and self.max_cache > 0:
+        if not Tower2_Model.train and self.use_cache:
+            self.kv_cache: Tensor = self.kv_cache.expand(batch_size, -1, -1).contiguous()
+            # 缓存本体, 扩展维度
+
             # ======== 历史缓存处理 ========
             past_c_kv, past_k_rope = torch.split(
                 self.kv_cache[:, :kv_cache_len, :], [self.dc_kv, self.d_rope], dim=-1
@@ -336,16 +332,16 @@ class MLA(MLAframe):
             k_rope = torch.cat([past_k_rope, k_rope], dim=1)
             # 拼接历史缓存与当前步 KV
 
-            c_kv = c_kv[:, -min(c_kv.size(1), self.max_len.size(0)):, :]
-            k_rope = k_rope[:, -min(k_rope.size(1), self.max_len.size(0)):, :]
+            c_kv = c_kv[:, -min(c_kv.size(1), self.max_kv_cache):, :]
+            k_rope = k_rope[:, -min(k_rope.size(1), self.max_kv_cache):, :]
             # 截断至最大长度
 
             # ======= 生成新缓存 =======
-            self.cache_pos = torch.zeros(min(seq_len, self.max_cache), dtype=torch.long)   # 更新缓存长度
-            self.kv_cache[:, :self.cache_pos.size(0), :] = torch.cat(
+            self.cache_pos = min(seq_len, self.max_kv_cache)   # 更新缓存长度
+            self.kv_cache[:, :self.cache_pos, :] = torch.cat(
                 [
-                    c_kv[:, :self.cache_pos.size(0), :],
-                    k_rope[:, :self.cache_pos.size(0), :],
+                    c_kv[:, :self.cache_pos, :],
+                    k_rope[:, :self.cache_pos, :],
                 ], dim=-1
             )   # 更新缓存
 
@@ -467,19 +463,18 @@ class Vit_MLA(MLAframe):
 
 class CrossMLA(MLA):
     """交叉多头潜在注意力 支持kv cache"""
-    def __init__(self, d, d_pre_head, head_num, max_len: int, max_cache: int
-        , use_dropout=False, device=None):
+    def __init__(self, d, d_pre_head, head_num, max_len: int,
+        use_cache: bool, use_dropout=False, device=None):
         """
         参数:
         - d: 输入/输出的维度
         - d_pre_head: 每个头的隐藏层维度 (非RoPE维度)
         - head_num: 头的数量
         - max_len: 最大序列长度
-        - max_cache: 最大 KV Cache 长度
         - use_dropout: 是否使用 dropout
         - device: 设备
         """
-        super().__init__(d, d_pre_head, head_num, max_len, max_cache, use_dropout, device)
+        super().__init__(d, d_pre_head, head_num, max_len, use_cache, use_dropout, device)
         self.text_cache_len = 0
 
     def forward(self, q_inputs: Tensor, kv_input: Tensor, q_pos_ids, kv_pos_ids):
@@ -495,13 +490,12 @@ class CrossMLA(MLA):
         # 获得批次与长度
 
         self.kv_cache: Tensor = self.kv_cache.expand(batch_size, -1, -1).contiguous()
-        kv_cache_len = self.cache_pos.size(0)    # kv 缓存长度
+        kv_cache_len = self.cache_pos if self.cache_pos is not None else 0    # kv 缓存长度
         new_cache = enc_seq_len - kv_cache_len   # 未缓存的编码器长度
-        self.max_len: Tensor
         # 这里只限制文本长度
         # 图像不管, 否则会丢失信息
 
-        new_text = text_seq_len - min(self.text_cache_len, self.max_len.size(0))
+        new_text = text_seq_len - min(self.text_cache_len, self.max_kv_cache)
         # 未缓存的文本长度
 
         # ===== quary 计算 =====
@@ -514,7 +508,6 @@ class CrossMLA(MLA):
         q_nope, q_rope = torch.split(q, [self.d_pre_head, self.d_rope], dim=-1)
         # 多头拆分 & 维度分割
 
-
         # ========== 处理当前步 KV 投影 ==========
         kv_inputs = kv_input[:, -new_cache:, :]
         # 未缓存大小
@@ -526,7 +519,7 @@ class CrossMLA(MLA):
 
         c_kv = self.kv_down_norm(c_kv)
 
-        if not Tower2_Model.train and self.max_cache > 0:
+        if not Tower2_Model.train and self.use_cache:
             # ======== 历史缓存处理 ========
             past_c_kv, past_k_rope = torch.split(
                 self.kv_cache[:, :kv_cache_len, :], [self.dc_kv, self.d_rope], dim=-1
@@ -537,11 +530,13 @@ class CrossMLA(MLA):
             # 拼接历史缓存与当前步 KV
 
             # ======= 生成新缓存 =======
-            self.cache_pos = torch.zeros(min(enc_seq_len, self.max_cache), dtype=torch.long)   # 更新缓存长度
-            self.kv_cache[:, :self.cache_pos.size(0), :] = torch.cat(
+            self.cache_pos = min(enc_seq_len, self.max_kv_cache)
+            # 更新缓存长度
+
+            self.kv_cache[:, :self.cache_pos, :] = torch.cat(
                 [
-                    c_kv[:, :self.cache_pos.size(0), :],
-                    k_rope[:, :self.cache_pos.size(0), :],
+                    c_kv[:, :self.cache_pos, :],
+                    k_rope[:, :self.cache_pos, :],
                 ], dim=-1
             )   # 更新缓存
 
@@ -651,7 +646,7 @@ class MOERouter(nn.Module):
 
 
 class SparseMOE(nn.Module):
-    def __init__(self, d, dff, expert_num, top_k):
+    def __init__(self, d, dff, expert_num, top_k, init_weights: bool=False):
         """
         稀疏混合专家模型
 
@@ -660,6 +655,7 @@ class SparseMOE(nn.Module):
         - dff: 映射维度
         - expert_num: 专家数量
         - top_k: 激活专家数
+        - init_weights: 是否初始化权重
         """
         super().__init__()
         self.d = d
@@ -675,6 +671,9 @@ class SparseMOE(nn.Module):
 
         self.router = MOERouter(self.d, self.expert_num, self.top_k)
         # 路由模块
+
+        if init_weights:   # 初始化权重
+            self.apply(generate_init_weights)
 
     def forward(self, x: Tensor):
         batch_size, seq_len, d = x.shape
@@ -717,21 +716,26 @@ class SparseMOE(nn.Module):
 
 class MOE(nn.Module):
     """混合专家模型"""
-    def __init__(self, d, dff, share_num, expert_num, top_k):
+    def __init__(self, d, dff, share_num, expert_num, top_k, init_weights: bool=False):
         """
         参数:
         - d: 每个专家的输入维度
         - dff: 映射维度
         - share_num: 共享专家数量
         - expert_num: 专家数量
+        - top_k: 激活专家数
+        - init_weights: 是否初始化权重
         """
         super().__init__()
-        self.moe = SparseMOE(d, dff, expert_num, top_k)
+        self.moe = SparseMOE(d, dff, expert_num, top_k, init_weights)
         # 稀疏混合专家模型
 
         self.share_experts = nn.ModuleList([
             Expert(d, dff) for _ in range(share_num)
         ])
+
+        if init_weights:   # 初始化权重
+            self.apply(generate_init_weights)
 
     def forward(self, x: Tensor):
         """
@@ -825,7 +829,7 @@ class Visual_Mask(nn.Module):
 class Decoder(nn.Module):
     """解码器"""
     def __init__(self, head_num: int, share_num: int, exp_num: int, top_k: int, d: int, dk: int,
-            max_len: int, max_cache: int, use_dropout: bool=False, init_weights: bool=False, ffn_type: str='ffn'):
+        max_len: int, use_cache: bool=False, use_dropout: bool=False, init_weights: bool=False, ffn_type: str='ffn'):
         """
         参数:
         - head_num: 注意力头数
@@ -835,16 +839,16 @@ class Decoder(nn.Module):
         - d: 输入/输出维度
         - dk: 每个头的维度
         - max_len: 最大序列长度
-        - max_cache: 最大缓存长度
+        - use_cache: 是否使用缓存
         - use_dropout: 是否使用dropout
         - init_weights: 是否初始化模型
         - ffn_type: 前馈网络类型 (ffn / moe)
         """
         super().__init__()
-        self.self_attn = MLA(d, dk, head_num, max_len, max_cache, use_dropout)
+        self.self_attn = MLA(d, dk, head_num, max_len, use_cache, use_dropout)
         # 多头自注意力层
 
-        self.cross_attn = CrossMLA(d, dk, head_num, max_len, max_cache, use_dropout)
+        self.cross_attn = CrossMLA(d, dk, head_num, max_len, use_cache, use_dropout)
         # 交叉多头自注意力层
 
         self.get_pos_ids = Get_Pos_ids()
@@ -862,9 +866,12 @@ class Decoder(nn.Module):
             # 前馈网络
 
         elif ffn_type == 'moe':
-            self.ffn = MOE(d, d//2, share_num, exp_num, top_k)
+            self.ffn = MOE(d, d//2, share_num, exp_num, top_k, init_weights)
             # 混合专家网络
             # 因为有很多专家, dff的维度较小
+
+        if init_weights:   # 初始化权重
+            self.apply(generate_init_weights)
 
     def forward(
             self, inputs_tuple: Tuple[Tensor, Tensor], enc_inputs: Optional[Tensor]=None
@@ -1051,6 +1058,9 @@ class VisionEncoder(nn.Module):
         self.ffn = FeedForward(d, 4*d, use_dropout)
         # 前馈网络
 
+        if init_weights:   # 初始化权重
+            self.apply(generate_init_weights)
+
     def forward(self, imgs: Tensor, patch_mask: Tensor) -> Tensor:
         """
         图像编码器前向传播
@@ -1078,6 +1088,25 @@ class VisionEncoder(nn.Module):
         return final_output
 
 
+def generate_init_weights(module: nn.Module):
+    """初始化模型权重"""
+    if isinstance(module, nn.Linear):   # 线性层
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:   # 线性层偏置
+            nn.init.zeros_(module.bias)
+
+    elif isinstance(module, nn.Embedding):   # 嵌入层
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if module.padding_idx is not None:
+            nn.init.zeros_(module.weight[module.padding_idx])
+
+    elif isinstance(module, (nn.LayerNorm, RMS_norm)):   # 层归一化
+        if hasattr(module, 'weight') and module.weight is not None:
+            nn.init.ones_(module.weight)
+        if hasattr(module, 'bias') and module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
 class Tower2_Model(nn.Module):
     """Tower2"""
     def __init__(
@@ -1095,7 +1124,7 @@ class Tower2_Model(nn.Module):
         patch_size: int,
         in_chans: int,
         max_len: int,
-        max_cache: int,
+        use_cache: bool,
         device: str,
         use_dropout: bool,
         init_weights: bool,
@@ -1118,7 +1147,7 @@ class Tower2_Model(nn.Module):
         - patch_size: 分割大小 (正方形)
         - in_chans: 输入通道数
         - max_len: 最大序列长度
-        - max_cache: 最大缓存长度
+        - use_cache: 是否使用缓存
         - device: 计算设备
         - use_dropout: 是否使用dropout
         - init_weights: 是否初始化模型
@@ -1167,7 +1196,7 @@ class Tower2_Model(nn.Module):
                 d=d,
                 dk=dk,
                 max_len=max_len,
-                max_cache=max_cache,
+                use_cache=use_cache,
                 use_dropout=use_dropout,
                 ffn_type=ffn_type
             ) for _ in range(decoder_num)
@@ -1178,6 +1207,9 @@ class Tower2_Model(nn.Module):
 
         self.last_linear = nn.Linear(d, vocab_size).to(self.device)
         # 输出线性层, 将解码器的输出映射到词汇表的大小
+
+        if init_weights:   # 初始化权重
+            self.apply(generate_init_weights)
 
     def forward(self, text_inputs: Tensor, imgs: Optional[Tensor]=None) -> Tensor:
         """
@@ -1236,7 +1268,7 @@ if __name__ == '__main__':
     inputs = torch.randint(
         low=0,
         high=10000,
-        size=(4, 128),
+        size=(4, 1024),
         dtype=torch.long
     ).to('cuda')
 
@@ -1261,10 +1293,10 @@ if __name__ == '__main__':
         patch_size=28,
         in_chans=3,
         max_len=256,
-        max_cache=0,
+        use_cache=False,
         device='cuda',
         use_dropout=False,
-        init_weights=False,
+        init_weights=True,
         ffn_type='moe'
     ).to('cuda')
 

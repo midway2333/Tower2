@@ -91,9 +91,9 @@ def collate_fn(batch):
 # 训练示例 ---------------------------------------------------------------
 def DemoTrain():
     # 配置参数
-    data_dir = "./tower2/demo"
+    data_dir = "demo"
     metadata_file = "test.json"
-    sp_model_path = "tower2/tokenizer/tower_dict_v1.0_32768.model"
+    sp_model_path = "tokenizer/tower_dict_v1.0_32768.model"
     batch_size = 1
     
     # 初始化数据集和数据加载器
@@ -114,16 +114,17 @@ def DemoTrain():
         share_num=4,
         exp_num=8,
         top_k=4,
-        coder_num=6,
+        decoder_num=6,
+        vit_num=6,
         pad_idx=dataset.pad_id,  # 使用SentencePiece的pad_id
         img_size=512,
         patch_size=28,
         in_chans=3,
-        max_len=1024,
-        max_cache=0,
+        max_len=256,
+        use_cache=False,
         device="cuda",
-        use_dropout=True,
-        init_weights=False,
+        use_dropout=False,
+        init_weights=True,
         ffn_type='moe'
     ).cuda()
     
