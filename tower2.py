@@ -71,7 +71,6 @@ class RoPE_Emb(nn.Module):
     def forward(self) -> Tuple:
         """
         生成RoPE位置编码
-        - seq_len: 序列长度
         """
 
         self.cos_cached: Tensor
@@ -118,6 +117,36 @@ def RoPE_apply(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, pos_ids: Tensor):
 
     q_embed = (q * cos) + (RoPE_rotate(q) * sin)
     k_embed = (k * cos) + (RoPE_rotate(k) * sin)
+    # 应用旋转位置编码
+
+    return q_embed, k_embed
+
+def RoPE_apply_with_cache(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, q_pos_ids: Tensor, k_pos_ids: Tensor):
+    """
+    在使用 KV cache 下应用 RoPE 编码
+    - q: query
+    - k: key
+    - cos: RoPE cos
+    - sin: RoPE sin
+    - q_pos_ids: query 位置索引
+    - k_pos_ids: key 位置索引
+    """
+    q_sin = sin[q_pos_ids].unsqueeze(1)   # 按位置索引选择sin值
+    q_cos = cos[q_pos_ids].unsqueeze(1)   # 按位置索引选择cos值
+    k_sin = sin[k_pos_ids].unsqueeze(1)   # 按位置索引选择sin值
+    k_cos = cos[k_pos_ids].unsqueeze(1)   # 按位置索引选择cos值
+
+    k_sin = k_sin[:, :, :k.size(2)]   # 仅保留最新的 k_pos_ids
+    k_cos = k_cos[:, :, :k.size(2)]   # 仅保留最新的 k_pos_ids
+
+    q = RoPE_reshape(q)
+    # 重塑 Query
+
+    k = RoPE_reshape(k)
+    # 重塑 Key
+
+    q_embed = (q * q_cos) + (RoPE_rotate(q) * q_sin)
+    k_embed = (k * k_cos) + (RoPE_rotate(k) * k_sin)
     # 应用旋转位置编码
 
     return q_embed, k_embed
@@ -180,9 +209,60 @@ class RMS_norm(nn.Module):
         # 还原原始数据类型
 
 
+def cache_update(cache: Tensor, inputs: Tensor, cache_pos: int | None, base_len: int):
+    """
+    更新缓存, 以适应新的输入
+
+    参数:
+    - cache: 缓存张量   [batch, cache_len, d]
+    - inputs: 新输入张量  [batch, seq_len, d]
+    - cache_pos: 当前缓存位置
+    - base_len: 保留的长度 (通常是全局提示词长度)
+    """
+    new_token = inputs.size(1)   # 新输入的长度
+    if cache_pos is None:   # 如果没有缓存位置, 则初始化为0
+        cache_pos = 0
+
+    # 情况1: 直接追加
+    if cache_pos + new_token <= cache.size(1):
+        cache[:, cache_pos:cache_pos + new_token] = inputs
+        new_cache_pos = cache_pos + new_token
+        return cache, new_cache_pos
+
+    # 情况2: 输入过大, 舍弃原缓存
+    elif base_len + new_token >= cache.size(1):
+        save_len = cache.size(1) - base_len
+        # 用的时候别整的 base_len > max_len
+        # 这情况是真救不了
+
+        cache = torch.cat(
+            [
+                cache[:, :base_len, :],   # 保留的基础缓存
+                inputs[:, -save_len:, :],   # 保留未丢弃的部分
+            ], dim=1
+        )   # 更新缓存
+
+        new_cache_pos = cache.size(1)
+        return cache, new_cache_pos
+
+    # 情况3: 需要丢弃旧数据
+    else:   # 缓存长度不足时, 丢弃最早的缓存
+        cache = torch.cat(
+            [
+                cache[:, :base_len, :],   # 保留的基础缓存
+                cache[:, base_len:(cache.size(1)-new_token), :],   # 保留未丢弃的部分
+                inputs,   # 新输入
+            ], dim=1
+        )   # 更新缓存
+
+        new_cache_pos = cache.size(1)
+        print("cache_pos:", new_cache_pos)
+        return cache, new_cache_pos
+
+
 class MLAframe(nn.Module):
     """MLA前置框架"""
-    def __init__(self, d, d_pre_head, head_num,
+    def __init__(self, d, d_pre_head, head_num, max_len: int=8192,
         use_dropout: bool=False, device: Optional[str]=None):
         """
         MLA前置框架
@@ -190,7 +270,7 @@ class MLAframe(nn.Module):
 
         参数:
         - d: 输入/输出的维度
-        - dk_pre_head: 每个头的隐藏层维度 (非RoPE维度)
+        - d_pre_head: 每个头的隐藏层维度 (非RoPE维度)
         - head_num: 头的数量
         - use_dropout: 是否使用dropout
         - device: 计算设备
@@ -202,72 +282,76 @@ class MLAframe(nn.Module):
         self.head_num = head_num
         self.use_dropout = use_dropout
         self.device = device
+        # 前置传入参数
 
-        self.d_rope = d_pre_head // 2
+        self.d_rope = d_pre_head // 2   # 0.5 d_head
         # 计算位置编码维度
 
-        self.dc_v = self.d_pre_head
+        self.dc_v = self.d_pre_head   # 1.0 d_head
         # value维度
 
-        self.dc_kv = 4 * self.d_pre_head   # kv Lora维度
-        self.dc_q = 3 * self.dc_kv         # quary Lora维度
+        self.dc_kv = self.d_pre_head // 8   # kv Lora维度   0.125 d_head
+        self.dc_q = d // 4         # quary Lora维度   0.25 d
         # 低秩压缩的维度
-        # 为什么是这个比例关系? 我也不知道, 反正ds是这么干的
+        # DeepSeek 此处 kv 压缩比为 1/14 , q 压缩比为 1/4.7
 
         self.out_proj = nn.Linear(
-            self.head_num * self.dc_v,
-            self.d,
+            self.head_num * self.dc_v,   # d_head * head_num
+            self.d,   # 1.0 d
             bias=False,
         )   # 输出投影
 
         # ================ quary Lora ================
-        self.q_head_dim = self.d_pre_head + self.d_rope
+        self.q_head_dim = self.d_pre_head + self.d_rope   # 1.5 d_head
         # 每个头的quary维度
 
+        self.attn_scale = self.q_head_dim ** -0.5
+        # 注意力缩放
+
         self.q_up = nn.Linear(
-            self.dc_q,
-            self.head_num * self.q_head_dim,
+            self.dc_q,   # 0.25 d
+            self.head_num * self.q_head_dim,   # 1.5 d_head * head_num
             bias=False,
         )   # 升维矩阵
 
         self.q_down = nn.Linear(
-            self.d,
-            self.dc_q,
+            self.d,   # d
+            self.dc_q,   # 0.25 d
             bias=False,
         )   # 降维矩阵
 
         self.q_down_norm = RMS_norm(self.dc_q)
 
         # =========== key & value Lora ===========
-        self.meg_d = self.d_pre_head + self.dc_v
+        self.meg_d = self.d_pre_head + self.dc_v   # 1.0 d_head + 0.125 d
         # 合并投影, 便于实现单次完成两者升维
 
         self.kv_up = nn.Linear(
-            self.dc_kv,
-            self.head_num * self.meg_d,
+            self.dc_kv,   # 0.125 d
+            self.head_num * self.meg_d,   # 1.0 d_head * head_num + 0.125 d * head_num
             bias=False,
         )   # 升维矩阵
 
         self.kv_down = nn.Linear(
-            self.d,
-            self.dc_kv + self.d_rope,
+            self.d,   # 1.0 d
+            self.dc_kv + self.d_rope,   # 0.125 d + 0.5 d_head
             bias=False,
         )   # 降维矩阵
 
-        self.kv_down_norm = RMS_norm(self.dc_kv)
+        self.kv_norm = RMS_norm(self.dc_kv)
 
         # ============ RoPE ============
         self.rope = RoPE_Emb(
             self.d_rope,
-            max_len=8192,
+            max_len=2 * max_len,   # 留足余量
             device=device,
         )
 
 
 class MLA(MLAframe):
     """多头潜在注意力, 通过低秩投影 (LoRA) 压缩 Q/K/V 维度"""
-    def __init__(self, d, d_pre_head, head_num, max_len: int, use_cache,
-        use_dropout: bool=False, device: Optional[str]=None):
+    def __init__(self, d: int, d_pre_head: int, head_num: int, max_len: int, use_cache: bool=False,
+        cache_type: Optional[str]=None, use_dropout: bool=False, device: Optional[str]=None):
         """
         我的想法是尽量减少亢余参数;  
         所以相比于主流实现而言自由度更小, 相应的传参更少
@@ -278,26 +362,56 @@ class MLA(MLAframe):
         - head_num: 头的数量
         - max_len: 最大序列长度
         - use_cache: 是否使用 KV 缓存
+        - cache_type: KV 缓存类型  (legacy / absorb)
         - use_dropout: 是否使用dropout
         - device: 计算设备
         """
-        super().__init__(d, d_pre_head, head_num, use_dropout, device)
+        super().__init__(d, d_pre_head, head_num, max_len, use_dropout, device)
 
         # ====== kv cache ======
         self.max_kv_cache = max_len
         self.use_cache = use_cache
+        self.cache_type = cache_type
         self.cache_pos = None   # 缓存位置
-        self.register_buffer("kv_cache", torch.zeros(1, max_len, self.dc_kv + self.d_rope), persistent=False)
 
-    def forward(self, inputs: Tensor, pos_ids, mask: Optional[Tensor]=None):   # type: ignore
+        if use_cache:
+            assert cache_type in ['legacy', 'absorb'],   \
+                "cache_type 必须是 'legacy' 或 'absorb' | cache_type must be 'legacy' or 'absorb'"
+
+            if cache_type == 'legacy':   # 传统缓存
+                self.register_buffer("kv_cache", torch.zeros(1, max_len, self.dc_kv + self.d_rope), persistent=False)
+
+            elif cache_type == 'absorb':   # 矩阵吸收缓存
+                self.register_buffer("kv_cache", torch.zeros(1, max_len, self.dc_kv), persistent=False)
+                self.register_buffer("pe_cache", torch.zeros(1, max_len, self.d_rope), persistent=False)
+
+        else:   # 不使用缓存
+            pass
+
+    def clean_cache(self):
+        """清除 KV 缓存"""
+        if self.cache_type == 'legacy':
+            self.kv_cache = torch.zeros(1, self.max_kv_cache, self.dc_kv + self.d_rope)
+        elif self.cache_type == 'absorb':
+            self.kv_cache = torch.zeros(1, self.max_kv_cache, self.dc_kv)
+            self.pe_cache = torch.zeros(1, self.max_kv_cache, self.d_rope)
+
+        else:
+            print("无缓存, 无需清除 | No cache to clear")
+
+        self.cache_pos = None
+
+    def without_cache_forward(self, inputs: Tensor, pos_ids: Tensor, mask: Optional[Tensor]=None) -> Tensor:
         """
-        - input: 输入序列 [batch, seq_len, d]
+        不使用缓存的前向传播
+
+        参数:
+        - inputs: 输入序列 [batch, seq_len, d]
         - pos_ids: 位置索引
-        - mask: 掩码
+        - mask: 掩码 [seq_len, seq_len]
+        - base_len: 基础长度 (通常是全局提示词长度)
         """
-        batch_size, seq_len, _ = inputs.size()
-        kv_cache_len = self.cache_pos if self.cache_pos is not None else 0   # 已缓存长度
-        new_token = inputs.size(1) - kv_cache_len   # 未缓存的长度
+        batch_size, seq_len, _ = inputs.size()   # 获得批次与长度
 
         # ===== quary 计算 =====
         q = self.q_down(inputs)
@@ -309,46 +423,15 @@ class MLA(MLAframe):
         q_nope, q_rope = torch.split(q, [self.d_pre_head, self.d_rope], dim=-1)
         # 多头拆分 & 维度分割
 
-        # ========== 处理当前步 KV 投影 ==========
-        qk_inputs = inputs[:, -new_token:, :]
-
-        current_c_kv_all = self.kv_down(qk_inputs)
+        # ========= KV 处理 =========
+        c_kv = self.kv_down(inputs)
         c_kv, k_rope = torch.split(
-            current_c_kv_all, [self.dc_kv, self.d_rope], dim=-1
+            c_kv, [self.dc_kv, self.d_rope], dim=-1
         )   # 分割维度
 
-        c_kv = self.kv_down_norm(c_kv)
+        c_kv: Tensor = self.kv_norm(c_kv)
+        # 归一化 KV
 
-        if not Tower2_Model.train and self.use_cache:
-            self.kv_cache: Tensor = self.kv_cache.expand(batch_size, -1, -1).contiguous()
-            # 缓存本体, 扩展维度
-
-            # ======== 历史缓存处理 ========
-            past_c_kv, past_k_rope = torch.split(
-                self.kv_cache[:, :kv_cache_len, :], [self.dc_kv, self.d_rope], dim=-1
-            )   # 拆分历史缓存
-
-            c_kv = torch.cat([past_c_kv, c_kv], dim=1)
-            k_rope = torch.cat([past_k_rope, k_rope], dim=1)
-            # 拼接历史缓存与当前步 KV
-
-            c_kv = c_kv[:, -min(c_kv.size(1), self.max_kv_cache):, :]
-            k_rope = k_rope[:, -min(k_rope.size(1), self.max_kv_cache):, :]
-            # 截断至最大长度
-
-            # ======= 生成新缓存 =======
-            self.cache_pos = min(seq_len, self.max_kv_cache)   # 更新缓存长度
-            self.kv_cache[:, :self.cache_pos, :] = torch.cat(
-                [
-                    c_kv[:, :self.cache_pos, :],
-                    k_rope[:, :self.cache_pos, :],
-                ], dim=-1
-            )   # 更新缓存
-
-            mask = None if mask is None else mask[-new_token:, :]
-            # 调整掩码形状
-
-        # ======== KV 合并处理 ========
         kv: Tensor = self.kv_up(c_kv)
         # 升维处理
 
@@ -361,13 +444,12 @@ class MLA(MLAframe):
         cos, sin = self.rope()
         q_rope, k_rope = RoPE_apply(
             q_rope, k_rope, cos, sin, pos_ids,
-        )
+        )   # 应用 RoPE 编码
 
         # ============ attention ============
         query = torch.concat(
             [q_nope, q_rope], dim=-1
-        )[:, -new_token: ,:]
-        # 拼接 Query, 只保留当前步
+        )   # 拼接 Query
 
         key = torch.concat(
             [k_nope, k_rope.expand(-1, self.head_num, -1, -1)], dim=-1
@@ -384,6 +466,176 @@ class MLA(MLAframe):
 
         return output
 
+    def legacy_forward(self, inputs: Tensor, all_pos_ids: Tensor, inputs_pos_ids: Tensor,
+        mask: Optional[Tensor]=None, base_len: int=0) -> Tensor:
+        """
+        传统缓存的前向传播, 使用 flash attention 优化
+
+        参数:
+        - inputs: 输入序列 [batch, seq_len, d]
+        - all_pos_ids: 全序列位置索引
+        - inputs_pos_ids: 输入位置索引
+        - mask: 掩码 [seq_len, seq_len]
+        - base_len: 基础长度 (通常是全局提示词长度)
+        """
+        batch_size, seq_len, _ = inputs.size()   # 获得批次与长度
+        new_token = inputs.size(1)
+
+        # ===== quary 计算 =====
+        q = self.q_down(inputs)
+        q = self.q_down_norm(q)
+        q = self.q_up(q)
+        # 低秩投影
+
+        q: Tensor = q.view(batch_size, seq_len, self.head_num, self.q_head_dim).transpose(1, 2)
+        q_nope, q_rope = torch.split(q, [self.d_pre_head, self.d_rope], dim=-1)
+        # 多头拆分 & 维度分割
+
+        # ======== 缓存处理 ========
+        c_kv = self.kv_down(inputs)
+        # 新输入的 token
+
+        self.kv_cache: Tensor = self.kv_cache.expand(batch_size, -1, -1).contiguous()
+        # 缓存本体, 扩展维度
+
+        self.kv_cache, self.cache_pos = cache_update(self.kv_cache, c_kv, self.cache_pos, base_len)
+        # 更新 KV 缓存
+
+        all_c_kv, k_rope = torch.split(self.kv_cache[:, :self.cache_pos, :], [self.dc_kv, self.d_rope], dim=-1)
+        # 分割 nope & rope
+
+        mask = None if mask is None else mask[-new_token:, :]
+        # 调整掩码形状
+
+         # ======== KV 合并处理 ========
+        kv: Tensor = self.kv_up(all_c_kv)
+        kv = kv.view(batch_size, all_c_kv.size(1), self.head_num, self.d_pre_head + self.dc_v).transpose(1, 2)
+        k_nope, value = torch.split(kv, [self.d_pre_head, self.dc_v], dim=-1)
+        k_rope = k_rope.view(batch_size, all_c_kv.size(1), 1, self.d_rope).transpose(1, 2)
+        # 形状转换 & 矩阵分割
+
+        # ============ RoPE 应用 ============
+        cos, sin = self.rope()
+        q_rope, k_rope = RoPE_apply_with_cache(
+            q_rope, k_rope, cos, sin, inputs_pos_ids, all_pos_ids,
+        )   # 应用 RoPE 编码
+
+        # ============ attention ============
+        query = torch.concat(
+            [q_nope, q_rope], dim=-1
+        )   # 拼接 Query
+
+        key = torch.concat(
+            [k_nope, k_rope.expand(-1, self.head_num, -1, -1)], dim=-1
+        )   # 拼接 Key
+
+        attn_output = fc.scaled_dot_product_attention(
+            query, key, value, attn_mask=mask,
+            dropout_p=0.05 if self.use_dropout else 0.0,
+        )   # 注意力计算
+
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        output = self.out_proj(attn_output)
+        # 变换形状, 输出投影
+
+        return output
+
+    def absorb_forward(self, inputs: Tensor, all_pos_ids: Tensor, inputs_pos_ids: Tensor,
+            mask: Optional[Tensor]=None, base_len: int=0) -> Tensor:
+        """
+        矩阵吸收优化缓存的前向传播
+        参数:
+        - inputs: 输入序列 [batch, seq_len, d]
+        - all_pos_ids: 全序列位置索引
+        - inputs_pos_ids: 输入位置索引
+        - mask: 掩码 [seq_len, seq_len]
+        - base_len: 基础长度 (通常是全局提示词长度)
+        """
+        batch_size, seq_len, _ = inputs.size()   # 获得批次与长度
+        new_token = inputs.size(1)
+
+        # ===== quary 计算 =====
+        q = self.q_down(inputs)
+        q = self.q_down_norm(q)
+        q = self.q_up(q)
+        # 低秩投影
+
+        q: Tensor = q.view(batch_size, seq_len, self.head_num, self.q_head_dim).transpose(1, 2)
+        q_nope, q_rope = torch.split(q, [self.d_pre_head, self.d_rope], dim=-1)
+        # 多头拆分 & 维度分割
+
+        # ======= KV 处理 =======
+        kv = self.kv_down(inputs)
+        # 新输入的 token
+
+        kv_nope, k_rope = torch.split(kv, [self.dc_kv, self.d_rope], dim=-1)
+        # 分割维度
+
+        # ============ RoPE 应用 ============
+        cos, sin = self.rope()
+        q_rope, k_rope = RoPE_apply_with_cache(
+            q_rope, k_rope.unsqueeze(1), cos, sin, inputs_pos_ids, inputs_pos_ids,
+        )   # 应用 RoPE 编码
+
+        k_rope = k_rope.squeeze(1)   # 去除多余维度
+
+        # ============ KV 缓存处理 ============
+        self.kv_cache: Tensor = self.kv_cache.expand(batch_size, -1, -1).contiguous()
+        self.pe_cache: Tensor = self.pe_cache.expand(batch_size, -1, -1).contiguous()
+        # 扩展 KV 缓存
+
+        self.kv_cache, _ = cache_update(self.kv_cache, kv_nope, self.cache_pos, base_len)
+        self.pe_cache, self.cache_pos = cache_update(self.pe_cache, k_rope, self.cache_pos, base_len)
+        # 更新 KV 缓存
+
+        # ============ attention ============
+        kv_up = self.kv_up.weight   # 升维矩阵
+        kv_up = kv_up.unsqueeze(0)
+        # 重塑 kv_up 矩阵
+
+        q_nope = torch.einsum("bshd,hdc->bshc", q_nope, kv_up[:, :self.d_pre_head])
+        # 矩阵吸收
+
+        attn_scores: Tensor = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:, :self.cache_pos]) +
+                torch.einsum("bshr,btr->bsht", q_rope, self.pe_cache[:, :self.cache_pos])) * self.attn_scale
+        # 注意力计算
+
+        if mask is not None:   # 掩码
+            attn_scores += mask
+
+        attn_scores = attn_scores.softmax(dim=-1, dtype=torch.float32)
+        # softmax
+
+        outputs = torch.einsum("bsht,btc->bshc", attn_scores, self.kv_cache[:, :self.cache_pos])
+        outputs = torch.einsum("bshc,hdc->bshd", outputs, kv_up[:, -self.dc_v:])
+        # value 计算 (矩阵吸收)
+
+        outputs = outputs.reshape(batch_size, seq_len, self.head_num * self.dc_v)
+        outputs = self.out_proj(outputs)   # 输出投影
+
+        return outputs
+
+    def forward(self, inputs: Tensor, all_pos_ids: Tensor, inputs_pos_ids: Optional[Tensor]=None,
+                mask: Optional[Tensor]=None, base_len: int=0) -> Tensor:
+        """
+        - input: 输入序列 [batch, seq_len, d]
+        - all_pos_ids: 全序列位置索引
+        - inputs_pos_ids: 输入位置索引
+        - mask: 掩码 [seq_len, seq_len]
+        - base_len: 基础长度 (通常是全局提示词长度)
+        """
+        if not self.use_cache:   # 不使用缓存时
+            return self.without_cache_forward(inputs, all_pos_ids, mask)
+
+        elif self.cache_type == 'legacy':   # 常规缓存
+            return self.legacy_forward(inputs, all_pos_ids, inputs_pos_ids, mask, base_len)   # type: ignore
+
+        elif self.cache_type == 'absorb':   # 矩阵吸收优化缓存
+            return self.absorb_forward(inputs, all_pos_ids, inputs_pos_ids, mask, base_len)   # type: ignore
+
+        else:   # 其他情况
+            return self.without_cache_forward(inputs, all_pos_ids, mask)
+
 
 class Vit_MLA(MLAframe):
     """多头潜在注意力, 通过低秩投影 (LoRA) 压缩 Q/K/V 维度"""
@@ -399,7 +651,7 @@ class Vit_MLA(MLAframe):
         - use_dropout: 是否使用dropout
         - device: 计算设备
         """
-        super().__init__(d, d_pre_head, head_num, use_dropout, device)
+        super().__init__(d, d_pre_head, head_num, 8192, use_dropout, device)
 
     def forward(self, inputs: Tensor, pos_ids, mask=None):
         """
@@ -424,7 +676,7 @@ class Vit_MLA(MLAframe):
         # ===== key & value 计算 ======
         c_kv = self.kv_down(inputs)
         c_kv, k_rope = torch.split(c_kv, [self.dc_kv, self.d_rope], dim=-1)
-        kv = self.kv_down_norm(c_kv)
+        kv = self.kv_norm(c_kv)
         kv = self.kv_up(kv)
         # 低秩投影
 
@@ -461,10 +713,9 @@ class Vit_MLA(MLAframe):
         return output
 
 
-class CrossMLA(MLA):
+class CrossMLA(MLAframe):
     """交叉多头潜在注意力 支持kv cache"""
-    def __init__(self, d, d_pre_head, head_num, max_len: int,
-        use_cache: bool, use_dropout=False, device=None):
+    def __init__(self, d, d_pre_head, head_num, use_dropout=False, device=None):
         """
         参数:
         - d: 输入/输出的维度
@@ -474,29 +725,21 @@ class CrossMLA(MLA):
         - use_dropout: 是否使用 dropout
         - device: 设备
         """
-        super().__init__(d, d_pre_head, head_num, max_len, use_cache, use_dropout, device)
+        super().__init__(d, d_pre_head, head_num, use_dropout, use_dropout)
         self.text_cache_len = 0
+
+        self.register_buffer("kv_cache", torch.zeros(1, 1, self.dc_kv), persistent=False)
 
     def forward(self, q_inputs: Tensor, kv_input: Tensor, q_pos_ids, kv_pos_ids):
         """
+        不使用缓存的前向传播
+
         - q_input: decoder 输入序列 [batch, text_seq_len, d]
         - kv_input: encoder 输入序列 [batch, encoder_seq_len, d]
         - q_pos_ids: 解码器位置ID [batch, text_seq_len]
         - kv_pos_ids: 编码器位置ID [batch, encoder_seq_len]
         """
-
         batch_size, text_seq_len, _ = q_inputs.size()
-        _, enc_seq_len, _ = kv_input.size()
-        # 获得批次与长度
-
-        self.kv_cache: Tensor = self.kv_cache.expand(batch_size, -1, -1).contiguous()
-        kv_cache_len = self.cache_pos if self.cache_pos is not None else 0    # kv 缓存长度
-        new_cache = enc_seq_len - kv_cache_len   # 未缓存的编码器长度
-        # 这里只限制文本长度
-        # 图像不管, 否则会丢失信息
-
-        new_text = text_seq_len - min(self.text_cache_len, self.max_kv_cache)
-        # 未缓存的文本长度
 
         # ===== quary 计算 =====
         q = self.q_down(q_inputs)
@@ -508,39 +751,15 @@ class CrossMLA(MLA):
         q_nope, q_rope = torch.split(q, [self.d_pre_head, self.d_rope], dim=-1)
         # 多头拆分 & 维度分割
 
-        # ========== 处理当前步 KV 投影 ==========
-        kv_inputs = kv_input[:, -new_cache:, :]
-        # 未缓存大小
-
-        current_c_kv_all = self.kv_down(kv_inputs)
+        # ========= KV 处理 =========
+        c_kv = self.kv_down(kv_input)
         c_kv, k_rope = torch.split(
-            current_c_kv_all, [self.dc_kv, self.d_rope], dim=-1
+            c_kv, [self.dc_kv, self.d_rope], dim=-1
         )   # 分割维度
 
-        c_kv = self.kv_down_norm(c_kv)
+        c_kv: Tensor = self.kv_norm(c_kv)
+        # 归一化 KV
 
-        if not Tower2_Model.train and self.use_cache:
-            # ======== 历史缓存处理 ========
-            past_c_kv, past_k_rope = torch.split(
-                self.kv_cache[:, :kv_cache_len, :], [self.dc_kv, self.d_rope], dim=-1
-            )   # 拆分历史缓存
-
-            c_kv = torch.cat([past_c_kv, c_kv], dim=1)
-            k_rope = torch.cat([past_k_rope, k_rope], dim=1)
-            # 拼接历史缓存与当前步 KV
-
-            # ======= 生成新缓存 =======
-            self.cache_pos = min(enc_seq_len, self.max_kv_cache)
-            # 更新缓存长度
-
-            self.kv_cache[:, :self.cache_pos, :] = torch.cat(
-                [
-                    c_kv[:, :self.cache_pos, :],
-                    k_rope[:, :self.cache_pos, :],
-                ], dim=-1
-            )   # 更新缓存
-
-        # ======== KV 合并处理 ========
         kv: Tensor = self.kv_up(c_kv)
         # 升维处理
 
@@ -548,18 +767,17 @@ class CrossMLA(MLA):
         k_nope, value = torch.split(kv, [self.d_pre_head, self.dc_v], dim=-1)
         k_rope = k_rope.view(batch_size, c_kv.size(1), 1, self.d_rope).transpose(1, 2)
         # 形状转换 & 矩阵分割
+
         # ============ RoPE 应用 ============
         cos, sin = self.rope()
         q_rope, k_rope = CrossRoPE_apply(
             q_rope, k_rope, cos, sin, q_pos_ids, kv_pos_ids,
-        )
+        )   # 应用 RoPE 编码
 
         # ============ attention ============
         query = torch.concat(
             [q_nope, q_rope], dim=-1
-        )[:, -new_text: ,:]   # 拼接 Query, 只保留当前步
-        self.text_cache_len = query.size(1)
-        # 获得文本缓存长度
+        )   # 拼接 Query
 
         key = torch.concat(
             [k_nope, k_rope.expand(-1, self.head_num, -1, -1)], dim=-1
@@ -762,13 +980,32 @@ class Get_Pos_ids(nn.Module):
         """创建并获得 pos_ids"""
         super().__init__()
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, _: int) -> tuple[Tensor, None]:
         """
         - x: 输入序列 [batch, seq_len, d]
+        - _ : 缓存位置 (未使用)
         """
         batch_size, seq_len = x.size(0), x.size(1)
         pos_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        return pos_ids  # [batch_size, seq_len]
+        return pos_ids, None  # [batch_size, seq_len]
+
+class Get_Pos_ids_with_cache(nn.Module):
+    """获得带缓存的 pos_ids"""
+    def __init__(self):
+        """创建并获得 pos_ids"""
+        super().__init__()
+
+    def forward(self, x: Tensor, cache_pos: int) -> tuple[Tensor, Tensor]:
+        """
+        - x: 输入序列 [batch, seq_len, d]
+        - cache_pos: 当前缓存位置
+        """
+        batch_size, seq_len = x.size(0), x.size(1)
+
+        all_pos_ids = torch.arange(cache_pos + seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+        inputs_pos_ids = torch.arange(cache_pos, cache_pos + seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+
+        return all_pos_ids, inputs_pos_ids   # 返回所有位置 ID 和输入位置 ID
 
 
 class Padding_Mask(nn.Module):
@@ -821,15 +1058,15 @@ class Visual_Mask(nn.Module):
         """
         - patch_mask: 块掩码 [batch, num_patches]
         """
-        visual_mask = patch_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, num_patches]
-        visual_mask = torch.where(visual_mask == 0, float('-inf'), 0.0)  # 无效位置设为-inf
+        visual_mask = patch_mask.unsqueeze(1).unsqueeze(2)   # [batch, 1, 1, num_patches]
+        visual_mask = torch.where(visual_mask == 0, float('-inf'), 0.0)   # 无效位置设为-inf
         return visual_mask
 
 
 class Decoder(nn.Module):
     """解码器"""
-    def __init__(self, head_num: int, share_num: int, exp_num: int, top_k: int, d: int, dk: int,
-        max_len: int, use_cache: bool=False, use_dropout: bool=False, init_weights: bool=False, ffn_type: str='ffn'):
+    def __init__(self, head_num: int, share_num: int, exp_num: int, top_k: int, d: int, dk: int, max_len: int,
+        use_cache: bool=False, cache_type: Optional[str]=None, use_dropout: bool=False, init_weights: bool=False, ffn_type: str='ffn'):
         """
         参数:
         - head_num: 注意力头数
@@ -840,18 +1077,19 @@ class Decoder(nn.Module):
         - dk: 每个头的维度
         - max_len: 最大序列长度
         - use_cache: 是否使用缓存
+        - cache_type: 缓存类型 (legacy / absorb)
         - use_dropout: 是否使用dropout
         - init_weights: 是否初始化模型
         - ffn_type: 前馈网络类型 (ffn / moe)
         """
         super().__init__()
-        self.self_attn = MLA(d, dk, head_num, max_len, use_cache, use_dropout)
+        self.self_attn = MLA(d, dk, head_num, max_len, use_cache, cache_type, use_dropout)
         # 多头自注意力层
 
-        self.cross_attn = CrossMLA(d, dk, head_num, max_len, use_cache, use_dropout)
+        self.cross_attn = CrossMLA(d, dk, head_num, use_dropout)
         # 交叉多头自注意力层
 
-        self.get_pos_ids = Get_Pos_ids()
+        self.get_pos_ids = Get_Pos_ids_with_cache() if use_cache else Get_Pos_ids()
         # 获得 pos_ids
 
         self.self_attn_norm = nn.LayerNorm(d)
@@ -890,11 +1128,15 @@ class Decoder(nn.Module):
         # 解包元组
 
         # ======= 自注意力阶段 =======
-        norm_input = self.self_attn_norm(inputs)
+        norm_input = self.self_attn_norm(inputs)   # 归一化输入
+        all_pos_ids, inputs_pos_ids = self.get_pos_ids(inputs,
+            self.self_attn.cache_pos if self.self_attn.cache_pos is not None else 0)
+        # 获取位置 ID
 
         self_attn_output = self.self_attn(
             norm_input,
-            pos_ids=self.get_pos_ids(inputs),
+            all_pos_ids=all_pos_ids,
+            inputs_pos_ids=inputs_pos_ids,
             mask=mask,
         )   # 自注意力计算
 
@@ -1125,6 +1367,7 @@ class Tower2_Model(nn.Module):
         in_chans: int,
         max_len: int,
         use_cache: bool,
+        cache_type: str | None,
         device: str,
         use_dropout: bool,
         init_weights: bool,
@@ -1148,6 +1391,7 @@ class Tower2_Model(nn.Module):
         - in_chans: 输入通道数
         - max_len: 最大序列长度
         - use_cache: 是否使用缓存
+        - cache_type: 缓存类型 (legacy / absorb)
         - device: 计算设备
         - use_dropout: 是否使用dropout
         - init_weights: 是否初始化模型
@@ -1197,6 +1441,7 @@ class Tower2_Model(nn.Module):
                 dk=dk,
                 max_len=max_len,
                 use_cache=use_cache,
+                cache_type=cache_type,
                 use_dropout=use_dropout,
                 ffn_type=ffn_type
             ) for _ in range(decoder_num)
@@ -1268,7 +1513,7 @@ if __name__ == '__main__':
     inputs = torch.randint(
         low=0,
         high=10000,
-        size=(4, 1024),
+        size=(1, 256),
         dtype=torch.long
     ).to('cuda')
 
@@ -1287,13 +1532,14 @@ if __name__ == '__main__':
         exp_num=8,
         top_k=2,
         decoder_num=6,
-        vit_num=6,
+        vit_num=0,
         pad_idx=0,
         img_size=1024,
         patch_size=28,
         in_chans=3,
         max_len=256,
-        use_cache=False,
+        use_cache=True,
+        cache_type='absorb',# / legacy
         device='cuda',
         use_dropout=False,
         init_weights=True,
@@ -1301,7 +1547,7 @@ if __name__ == '__main__':
     ).to('cuda')
 
     # tower = torch.compile(tower)  # Compile the model for optimization
-    output: Tensor = tower(inputs, imgs)
+    output: Tensor = tower(inputs)#, imgs)
     print(output.shape)
 
     def count_parameters(model):
