@@ -343,7 +343,7 @@ class MLAframe(nn.Module):
         # ============ RoPE ============
         self.rope = RoPE_Emb(
             self.d_rope,
-            max_len=2 * max_len,   # 留足余量
+            max_len=2 * max_len if 2 * max_len > 8192 else 8192,   # 留足余量
             device=device,
         )
 
@@ -980,7 +980,7 @@ class Get_Pos_ids(nn.Module):
         """创建并获得 pos_ids"""
         super().__init__()
 
-    def forward(self, x: Tensor, _: int) -> tuple[Tensor, None]:
+    def forward(self, x: Tensor, _: int=0) -> tuple[Tensor, None]:
         """
         - x: 输入序列 [batch, seq_len, d]
         - _ : 缓存位置 (未使用)
@@ -1090,6 +1090,7 @@ class Decoder(nn.Module):
         # 交叉多头自注意力层
 
         self.get_pos_ids = Get_Pos_ids_with_cache() if use_cache else Get_Pos_ids()
+        self.cross_pos_ids = Get_Pos_ids()
         # 获得 pos_ids
 
         self.self_attn_norm = nn.LayerNorm(d)
@@ -1112,7 +1113,7 @@ class Decoder(nn.Module):
             self.apply(generate_init_weights)
 
     def forward(
-            self, inputs_tuple: Tuple[Tensor, Tensor], enc_inputs: Optional[Tensor]=None
+            self, inputs_tuple: Tuple[Tensor, Tensor], enc_inputs: Optional[Tensor]=None, base_len: int=0
         ) -> Tuple:
         """
         layer_norm 使用 Pre-LN 结构
@@ -1122,6 +1123,7 @@ class Decoder(nn.Module):
         - input: 输入序列 [batch, seq_len, model_dim]
         - mask: 目标序列的掩码 [batch, seq_len]
         - enc_inputs: 编码器输入序列 [batch, seq_len, model_dim]
+        - base_len: 基础长度 (通常是全局提示词长度)
         """
 
         inputs, mask = inputs_tuple
@@ -1138,6 +1140,7 @@ class Decoder(nn.Module):
             all_pos_ids=all_pos_ids,
             inputs_pos_ids=inputs_pos_ids,
             mask=mask,
+            base_len=base_len,
         )   # 自注意力计算
 
         self_attn_output = inputs + self_attn_output
@@ -1146,12 +1149,16 @@ class Decoder(nn.Module):
 
         # ======= 交叉注意力阶段 =======
         if enc_inputs is not None:
+            q_pos_ids, _ = self.cross_pos_ids(inputs)
+            kv_pos_ids, _ = self.cross_pos_ids(enc_inputs)
+            # 获得 pos_ids
+
             norm_cross = self.cross_attn_norm(self_attn_output)
             cross_attn_output = self.cross_attn(
                 norm_cross, 
                 enc_inputs,
-                q_pos_ids=self.get_pos_ids(inputs),
-                kv_pos_ids=self.get_pos_ids(enc_inputs),
+                q_pos_ids=q_pos_ids,
+                kv_pos_ids=kv_pos_ids,
             )   # 交叉注意力计算
 
             attn_output = self_attn_output + cross_attn_output
@@ -1312,10 +1319,11 @@ class VisionEncoder(nn.Module):
         # ===== 自注意力阶段 =====
         residual = imgs
         norm_input = self.self_attn_norm(imgs)
+        pos_ids, _ = self.get_pos_ids(imgs)
 
         self_attn_output = self.self_attn(
             norm_input,
-            pos_ids=self.get_pos_ids(imgs),
+            pos_ids=pos_ids,
             mask=self.visual_mask(patch_mask),
         )   # 自注意力计算
 
@@ -1456,11 +1464,12 @@ class Tower2_Model(nn.Module):
         if init_weights:   # 初始化权重
             self.apply(generate_init_weights)
 
-    def forward(self, text_inputs: Tensor, imgs: Optional[Tensor]=None) -> Tensor:
+    def forward(self, text_inputs: Tensor, imgs: Optional[Tensor]=None, base_len: int=0) -> Tensor:
         """
         前向传播
         - text_inputs: text输入序列 [batch, seq_len]
         - imgs: 图像输入序列 [batch, in_chans, img_size, img_size]
+        - base_len: 基础长度 (用于缓存位置, 默认为0)
         """
         embed_output = self.embed(text_inputs)
         # 嵌入层
@@ -1496,7 +1505,7 @@ class Tower2_Model(nn.Module):
             # 没有图像输入时
 
         for decoder in self.decoders:   # 解码器计算
-            dec_input, _ = decoder((dec_input, text_mask), img_output)
+            dec_input, _ = decoder((dec_input, text_mask), img_output, base_len)
 
         decoder_output = dec_input
         # 解码器输出
@@ -1520,7 +1529,7 @@ if __name__ == '__main__':
     imgs = torch.randint(
          low=0,
          high=255,
-         size=(4, 3, 1024, 1024),
+         size=(1, 3, 1024, 1024),
          dtype=torch.long
     ).to('cuda')
 
@@ -1532,7 +1541,7 @@ if __name__ == '__main__':
         exp_num=8,
         top_k=2,
         decoder_num=6,
-        vit_num=0,
+        vit_num=6,
         pad_idx=0,
         img_size=1024,
         patch_size=28,
@@ -1547,7 +1556,7 @@ if __name__ == '__main__':
     ).to('cuda')
 
     # tower = torch.compile(tower)  # Compile the model for optimization
-    output: Tensor = tower(inputs)#, imgs)
+    output: Tensor = tower(inputs, imgs)
     print(output.shape)
 
     def count_parameters(model):
