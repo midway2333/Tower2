@@ -122,16 +122,18 @@ def DemoTrain():
         in_chans=3,
         max_len=256,
         use_cache=False,
+        cache_type=None,
         device="cuda",
         use_dropout=False,
         init_weights=True,
-        ffn_type='moe'
+        ffn_type='moe',
+        train=True,   # 设置为训练模式
     ).cuda()
     
     # 训练配置
-    optimizer = AdamW8bit(model.parameters(), lr=1e-4)
+    optimizer = AdamW8bit(model.parameters(), lr=5e-4)
     
-    for epoch in range(150):
+    for epoch in range(100):
         model.train()
         total_loss = 0
         
