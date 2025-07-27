@@ -487,7 +487,7 @@ class MLA(MLAframe):
         q = self.q_up(q)
         # 低秩投影
 
-        q: Tensor = q.view(batch_size, seq_len, self.head_num, self.q_head_dim).transpose(1, 2)
+        q: Tensor = q.view(batch_size, seq_len, self.head_num, self.q_head_dim).transpose(1, 2).contiguous()
         q_nope, q_rope = torch.split(q, [self.d_pre_head, self.d_rope], dim=-1)
         # 多头拆分 & 维度分割
 
@@ -504,14 +504,14 @@ class MLA(MLAframe):
         all_c_kv, k_rope = torch.split(self.kv_cache[:, :self.cache_pos, :], [self.dc_kv, self.d_rope], dim=-1)
         # 分割 nope & rope
 
-        mask = None if mask is None else mask[-new_token:, :]
+        mask = None if mask is None else mask[-new_token:, :].contiguous()
         # 调整掩码形状
 
          # ======== KV 合并处理 ========
         kv: Tensor = self.kv_up(all_c_kv)
         kv = kv.view(batch_size, all_c_kv.size(1), self.head_num, self.d_pre_head + self.dc_v).transpose(1, 2)
         k_nope, value = torch.split(kv, [self.d_pre_head, self.dc_v], dim=-1)
-        k_rope = k_rope.view(batch_size, all_c_kv.size(1), 1, self.d_rope).transpose(1, 2)
+        k_rope = k_rope.view(batch_size, all_c_kv.size(1), 1, self.d_rope).transpose(1, 2).contiguous()
         # 形状转换 & 矩阵分割
 
         # ============ RoPE 应用 ============
@@ -530,7 +530,7 @@ class MLA(MLAframe):
         )   # 拼接 Key
 
         attn_output = fc.scaled_dot_product_attention(
-            query, key, value, attn_mask=mask,
+            query.contiguous(), key.contiguous(), value.contiguous(), attn_mask=mask,
             dropout_p=0.05 if self.use_dropout else 0.0,
         )   # 注意力计算
 
@@ -590,9 +590,10 @@ class MLA(MLAframe):
 
         # ============ attention ============
         kv_up = self.kv_up.weight   # 升维矩阵
-        kv_up = kv_up.unsqueeze(0)
+        kv_up = kv_up.view(self.head_num, -1, self.dc_kv)
         # 重塑 kv_up 矩阵
 
+        q_nope, q_rope = q_nope.transpose(1, 2), q_rope.transpose(1, 2)
         q_nope = torch.einsum("bshd,hdc->bshc", q_nope, kv_up[:, :self.d_pre_head])
         # 矩阵吸收
 
@@ -601,7 +602,7 @@ class MLA(MLAframe):
         # 注意力计算
 
         if mask is not None:   # 掩码
-            attn_scores += mask
+            attn_scores += mask.transpose(1, 2)
 
         attn_scores = attn_scores.softmax(dim=-1, dtype=torch.float32)
         # softmax
@@ -1380,6 +1381,7 @@ class Tower2_Model(nn.Module):
         use_dropout: bool,
         init_weights: bool,
         ffn_type: str,
+        train: bool,
     ):
         """
         总模型实现
@@ -1404,11 +1406,15 @@ class Tower2_Model(nn.Module):
         - use_dropout: 是否使用dropout
         - init_weights: 是否初始化模型
         - ffn_type: 前馈网络类型 (ffn / moe)
+        - train: 是否处于训练模式 (独立参数, 并非 torch.module.train)
         """
 
         super().__init__()
         self.device = device
         # 初始化设备类型
+
+        self.training = train
+        # 是否处于训练模式
 
         d = dk * head_num
         # 计算输入维度
@@ -1474,14 +1480,18 @@ class Tower2_Model(nn.Module):
         embed_output = self.embed(text_inputs)
         # 嵌入层
 
-        padding_mask = self.pad_mask(text_inputs)
-        # 填充掩码
+        if self.training:   # 训练阶段
+            padding_mask = self.pad_mask(text_inputs)
+            # 填充掩码
 
-        causal_mask = self.casual_mask(text_inputs)
-        # 因果掩码
+            causal_mask = self.casual_mask(text_inputs)
+            # 因果掩码
 
-        text_mask = padding_mask + causal_mask
-        # 组合掩码
+            text_mask = padding_mask + causal_mask
+            # 组合掩码
+
+        else:   # 推理阶段
+            text_mask = None
 
         dec_input = embed_output
 
@@ -1522,7 +1532,7 @@ if __name__ == '__main__':
     inputs = torch.randint(
         low=0,
         high=10000,
-        size=(1, 256),
+        size=(1, 64),
         dtype=torch.long
     ).to('cuda')
 
@@ -1552,7 +1562,8 @@ if __name__ == '__main__':
         device='cuda',
         use_dropout=False,
         init_weights=True,
-        ffn_type='moe'
+        ffn_type='moe',
+        train=True,
     ).to('cuda')
 
     # tower = torch.compile(tower)  # Compile the model for optimization

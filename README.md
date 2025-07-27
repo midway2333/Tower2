@@ -88,8 +88,14 @@
 - 重构 kv cache <br>
 </details>
 
-<details open> 
+<details close> 
 <summary>  <b>25.7.24更新</b> </summary>
 - 修复 MLA 内存使用错误, 内存使用降低了十倍甚至是九倍() <br>
 - 再次重构 kv cache, 支持了传统缓存与矩阵吸收缓存 <br>
+</details>
+
+<details open> 
+<summary>  <b>25.7.27更新</b> </summary>
+- 修复矩阵吸收下 head num 维度和 token steps 维度与预期相反的错误 <br>
+- 上传了新的 demo, 与更新后的代码相匹配 <br>
 </details>
