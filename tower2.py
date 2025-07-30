@@ -1467,7 +1467,7 @@ class Tower2_Model(nn.Module):
         self.last_linear = nn.Linear(d, vocab_size, bias=False).to(self.device)
         # 输出线性层, 将解码器的输出映射到词汇表的大小
 
-        self.embed.weight = self.last_linear.weight
+        self.last_linear.weight = self.embed.weight
         # 嵌入层与输出线性层共享权重
 
         if init_weights:   # 初始化权重
