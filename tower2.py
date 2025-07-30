@@ -801,13 +801,13 @@ class Expert(nn.Module):
     def __init__(self, d, dff):
         """标准的 SwiGLU 结构"""
         super().__init__()
-        self.Wx = nn.Linear(d, dff)
+        self.Wx = nn.Linear(d, dff, bias=False)
         # 映射线性层
         
-        self.Vx = nn.Linear(d, dff)
+        self.Vx = nn.Linear(d, dff, bias=False)
         # 门控机制
 
-        self.last_linear = nn.Linear(dff, d)
+        self.last_linear = nn.Linear(dff, d, bias=False)
         # 输出线性层
 
     def forward(self, inputs: Tensor):
@@ -1464,8 +1464,11 @@ class Tower2_Model(nn.Module):
         self.final_norm = RMS_norm(d).to(self.device)
         # 输出归一化, 有利于稳定输出分布
 
-        self.last_linear = nn.Linear(d, vocab_size).to(self.device)
+        self.last_linear = nn.Linear(d, vocab_size, bias=False).to(self.device)
         # 输出线性层, 将解码器的输出映射到词汇表的大小
+
+        self.embed.weight = self.last_linear.weight
+        # 嵌入层与输出线性层共享权重
 
         if init_weights:   # 初始化权重
             self.apply(generate_init_weights)

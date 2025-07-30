@@ -94,8 +94,14 @@
 - 再次重构 kv cache, 支持了传统缓存与矩阵吸收缓存 <br>
 </details>
 
-<details open> 
+<details close> 
 <summary>  <b>25.7.27更新</b> </summary>
 - 修复矩阵吸收下 head num 维度和 token steps 维度与预期相反的错误 <br>
 - 上传了新的 demo, 与更新后的代码相匹配 <br>
+</details>
+
+<details open> 
+<summary>  <b>25.7.30更新</b> </summary>
+- 共享 embed 与 last_linear 权重 <br>
+- 去除了部分线性偏置 <br>
 </details>
